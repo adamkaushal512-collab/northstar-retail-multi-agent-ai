@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local secrets and environment files (never commit credentials)
+.env
+.env.*
+
+# Terraform local state and caches (see ADR-005; state belongs in a remote backend)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# OS
+.DS_Store

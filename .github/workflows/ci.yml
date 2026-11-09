@@ -1,0 +1,38 @@
+# Minimal CI for the NorthStar Retail repository skeleton (Step 1.8).
+# Runs the standard-library package-import tests on pull requests to main.
+# No secrets, cloud credentials, external services or infrastructure.
+# Architecture-neutral: tests import alternatives A, B and C independently;
+# no alternative is selected or favored here.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+# Least privilege: the workflow can only read repository contents.
+permissions:
+  contents: read
+
+jobs:
+  import-tests:
+    name: Package import tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Minimum version allowed by pyproject.toml (requires-python >=3.11)
+          python-version: "3.11"
+
+      - name: Run package import tests
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v
