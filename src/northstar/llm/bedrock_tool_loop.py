@@ -194,7 +194,10 @@ def _tool_uses(
         if tool_use_id in seen:
             raise ToolLoopError("duplicate toolUseId in one response", code="MalformedResponse", tool_calls=tuple(calls))
         seen.add(tool_use_id)
-        if tool_use.get("name") not in registry.TOOL_NAMES:
+        name = tool_use.get("name")
+        # Step 2.6F: check the type first; an unhashable name (list, dict)
+        # raised TypeError from the set lookup and bypassed this audit.
+        if not isinstance(name, str) or name not in registry.TOOL_NAMES:
             # The unsupported name is model text: it is not recorded.
             auditor.emit(
                 "tool.rejected",
