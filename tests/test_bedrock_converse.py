@@ -5,6 +5,7 @@ runs only when botocore is installed.
 """
 
 import importlib.util
+import sys
 import unittest
 from unittest import mock
 
@@ -110,6 +111,49 @@ class InvestigateDelayTests(unittest.TestCase):
             bc.investigate_delay(EVIDENCE, client=client)
         self.assertEqual(ctx.exception.code, "ThrottlingException")
         self.assertTrue(ctx.exception.retryable)
+
+
+class NoBotocoreTests(unittest.TestCase):
+    """Regression: with botocore absent (as in CI), the except clauses in
+    ``_converse`` must stay valid and let non-AWS errors propagate unchanged
+    instead of raising TypeError."""
+
+    def setUp(self):
+        # A None entry in sys.modules makes the import raise ImportError.
+        patcher = mock.patch.dict(sys.modules, {"botocore": None, "botocore.exceptions": None})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _call_with(self, error):
+        client = mock.Mock()
+        client.converse.side_effect = error
+        return bc._converse(client, {})
+
+    def test_botocore_is_unimportable_in_this_test(self):
+        with self.assertRaises(ImportError):
+            import botocore.exceptions  # noqa: F401
+
+    def test_runtime_error_propagates_unchanged(self):
+        error = RuntimeError("boom")
+        with self.assertRaises(RuntimeError) as ctx:
+            self._call_with(error)
+        self.assertIs(ctx.exception, error)
+
+    def test_bedrock_invocation_error_subclass_propagates_unchanged(self):
+        # Mirrors LiveCallBudgetExceeded, a BedrockInvocationError subclass.
+        class BudgetExceeded(bc.BedrockInvocationError):
+            pass
+
+        error = BudgetExceeded("cap reached", code="LiveCallBudgetExceeded")
+        with self.assertRaises(BudgetExceeded) as ctx:
+            self._call_with(error)
+        self.assertIs(ctx.exception, error)
+        self.assertEqual(ctx.exception.code, "LiveCallBudgetExceeded")
+
+    def test_success_still_returns_response(self):
+        client = mock.Mock()
+        client.converse.return_value = MOCK_RESPONSE
+        self.assertIs(bc._converse(client, {}), MOCK_RESPONSE)
 
 
 INJECTION_EVIDENCE = (
