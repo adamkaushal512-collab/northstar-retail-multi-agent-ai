@@ -24,6 +24,7 @@ PACKAGES = [
     "northstar.state",
     "northstar.observability",
     "northstar.llm",
+    "northstar.tools",
 ]
 
 ALTERNATIVES = [
