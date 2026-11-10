@@ -319,6 +319,10 @@ def parse_response(response: dict[str, Any], model_id: str, region: str) -> Mode
     return _model_result(response, text, model_id, region, stop_reason)
 
 
+class _BotocoreUnavailable(Exception):
+    """Placeholder for botocore exception types when botocore is absent; never raised."""
+
+
 def _converse(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     """Call Converse, mapping AWS errors to ``BedrockInvocationError``."""
     try:
@@ -329,7 +333,10 @@ def _converse(client: Any, request: dict[str, Any]) -> dict[str, Any]:
             NoRegionError,
         )
     except ImportError:  # only reachable with an injected test client
-        BotoCoreError = ClientError = NoCredentialsError = NoRegionError = ()  # type: ignore[misc,assignment]
+        # A never-raised placeholder class keeps every handler below valid. An
+        # empty tuple is not: ``except ((), ())`` raises TypeError. Any other
+        # exception propagates unchanged (fail closed).
+        BotoCoreError = ClientError = NoCredentialsError = NoRegionError = _BotocoreUnavailable  # type: ignore[misc,assignment]
 
     try:
         return client.converse(**request)
