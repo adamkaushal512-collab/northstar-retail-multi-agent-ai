@@ -1,5 +1,6 @@
 # Minimal CI for the NorthStar Retail repository skeleton (Step 1.8).
-# Runs the standard-library package-import tests on pull requests to main.
+# Runs the unit tests on pull requests to main (pydantic is the only
+# runtime dependency; boto3 is optional and not installed).
 # No secrets, cloud credentials, external services or infrastructure.
 # Architecture-neutral: tests import alternatives A, B and C independently;
 # no alternative is selected or favored here.
@@ -31,7 +32,10 @@ jobs:
           # Minimum version allowed by pyproject.toml (requires-python >=3.11)
           python-version: "3.11"
 
-      - name: Run package import tests
+      - name: Install package dependencies
+        run: python -m pip install .
+
+      - name: Run unit tests
         env:
           PYTHONPATH: src
           PYTHONDONTWRITEBYTECODE: "1"
