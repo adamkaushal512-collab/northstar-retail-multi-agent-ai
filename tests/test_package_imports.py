@@ -23,6 +23,7 @@ PACKAGES = [
     "northstar.evidence",
     "northstar.state",
     "northstar.observability",
+    "northstar.llm",
 ]
 
 ALTERNATIVES = [

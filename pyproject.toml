@@ -17,6 +17,10 @@ description = "NorthStar Retail delayed delivery investigation platform (reposit
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+# Step 2.4B Bedrock experiment only (ADR-001 Proposed). Not needed for tests.
+bedrock = ["boto3>=1.35"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
