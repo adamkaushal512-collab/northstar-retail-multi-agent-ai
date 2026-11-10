@@ -1,7 +1,7 @@
-# Minimal package configuration for the Step 1.8 repository skeleton.
-# Structure only: no runtime dependencies, no application logic.
+# Minimal package configuration for the NorthStar repository.
+# Runtime dependency: pydantic v2 (Step 2.5B investigation schema).
 #
-# Run the tests (standard library only, no install needed):
+# Run the tests (install pydantic first, e.g. `pip install .`):
 #   PYTHONPATH=src python3 -m unittest discover -s tests -v
 # Or, if pytest is installed:
 #   python3 -m pytest
@@ -15,7 +15,10 @@ name = "northstar-investigation"
 version = "0.0.0"
 description = "NorthStar Retail delayed delivery investigation platform (repository skeleton; fictional company)"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    # Step 2.5B structured investigation schema (strict validation).
+    "pydantic>=2.7,<3",
+]
 
 [project.optional-dependencies]
 # Step 2.4B Bedrock experiment only (ADR-001 Proposed). Not needed for tests.
