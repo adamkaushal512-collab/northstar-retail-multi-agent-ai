@@ -1,11 +1,12 @@
 """Investigation state contract for a LangGraph candidate of alternative C.
 
-[Proposal] LangGraph is a candidate only (ADR-002 Proposed); it is not a
-dependency of this repository and is not imported here. The contract uses
-standard-library ``TypedDict`` plus ``Annotated`` reducers, which is the
-shape LangGraph's ``StateGraph`` accepts, so the same state can be tested
-offline. No graph nodes, routing, agent count or live calls are defined;
-the number of specialists stays a benchmark parameter (AA sections 3.3, 8).
+[Proposal] LangGraph is a candidate only (ADR-002 Proposed); it is an
+optional extra and is not imported here. The contract uses standard-library
+``TypedDict`` plus ``Annotated`` reducers, which is the shape LangGraph's
+``StateGraph`` accepts, so the same state can be tested offline. The Step 3.3
+evidence nodes live in ``evidence_graph``; no routing, agent count or live
+calls are defined here, and the number of specialists stays a benchmark
+parameter (AA sections 3.3, 8).
 
 Reused Phase 2 types (not redefined): ``DeliveryStatus`` and
 ``DelayedDeliveryInvestigation`` from ``northstar.evidence.investigation_schema``;
@@ -56,7 +57,8 @@ UNVERIFIED and ``validate_state`` raises for any VERIFIED claim (in
 ``delivery_status``, in either evidence slot, or in ``final_investigation``)
 that is not backed by trusted carrier evidence.
 
-Enforcement deferred to graph nodes [Open] (no nodes exist yet):
+Enforcement in graph nodes (Step 3.3 ``evidence_graph`` implements the
+first two points for its OMS and carrier nodes; later nodes must follow them):
 
 - Nodes must obtain carrier evidence only through
   ``retrieve_carrier_evidence`` and must turn ``AccessDeniedError``,
