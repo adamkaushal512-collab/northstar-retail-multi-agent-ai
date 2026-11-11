@@ -1,14 +1,27 @@
-"""Sequential OMS -> carrier evidence graph (Step 3.3).
+"""Conditional OMS -> carrier evidence graph (Steps 3.3 and 3.4).
 
 [Proposal] LangGraph is a candidate only (ADR-002 Proposed). This module is
 part of the LangGraph hands-on implementation used to benchmark the B and C
 candidates (ADR-002 section 3, AA section 8). It does not select an
 architecture or an agent count: it has no model, coordinator or specialist
 nodes, only two deterministic evidence-retrieval nodes over the Phase 2
-read-only tools. Requires the optional ``langgraph`` extra.
+read-only tools and one deterministic routing function. Requires the
+optional ``langgraph`` extra.
 
-Graph: START -> retrieve_oms_evidence -> retrieve_carrier_evidence -> END.
-No conditional routing, parallel branches, checkpointer, recovery or human
+Graph (Step 3.4)::
+
+    START -> retrieve_oms_evidence --route_after_oms--> retrieve_carrier_evidence -> END
+                                   --route_after_oms--> END (OMS not RETRIEVED)
+
+``route_after_oms`` is a pure function of the validated state. It routes to
+the carrier node only when ``oms_evidence`` is valid OMS evidence with
+``retrieval_status`` RETRIEVED and a usable payload for the requested order.
+DENIED, NOT_FOUND, UNAVAILABLE, ERROR and every other unsuccessful OMS
+retrieval end the run with no carrier call, ``delivery_status`` UNVERIFIED,
+``requires_human_review`` true and the OMS node's ``SafeError``. Missing,
+malformed or contradictory OMS evidence raises ``InvalidStateError``. It
+never reads route flags, error strings, model output or runtime context.
+No parallel branches, checkpointer, retries, recovery, model nodes or human
 approval steps (later steps; human steps stay outside LangGraph, ADR-002
 section 3.4).
 
@@ -39,6 +52,9 @@ Fail closed [Decision D12, D15, D18; FR-EVD-01, FR-EVD-03 to FR-EVD-05]:
   ``effective_delivery_status``, so it is VERIFIED only for fresh, attested
   carrier evidence. OMS evidence never verifies delivery.
 - ``requires_human_review`` stays true (reducer); no node writes it.
+- Routing adds no authorization: a carrier retrieval reached through the
+  router is still authorized by its own tool call, and an OMS success
+  never verifies delivery.
 
 [Open] ``SafeError.retryable`` is always false here; retry classification
 belongs to recovery (later step) and NFR retry targets (Step 1.4).
@@ -47,7 +63,7 @@ belongs to recovery (later step) and NFR retry targets (Step 1.4).
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
@@ -83,6 +99,15 @@ from northstar.tools.order_details import (
 OMS_NODE = "retrieve_oms_evidence"
 CARRIER_NODE = "retrieve_carrier_evidence"
 NODE_ORDER = (OMS_NODE, CARRIER_NODE)
+
+# Exactly the fields ``get_order_details`` returns (``dict[str, str]``); a
+# RETRIEVED OMS payload must have these keys and no others, all strings.
+# A test checks this set against the tool's real output.
+OMS_PAYLOAD_FIELDS = frozenset({"order_id", "order_status", "promised_delivery_date", "carrier"})
+# Routing targets after the OMS node; also the conditional-edge path map.
+ROUTE_TO_CARRIER = CARRIER_NODE
+ROUTE_TO_END = END
+OMS_ROUTES = {ROUTE_TO_CARRIER: CARRIER_NODE, ROUTE_TO_END: END}
 
 # Value-free error codes. [Proposal] Names are illustrative.
 ACCESS_DENIED = "ACCESS_DENIED"
@@ -123,13 +148,50 @@ def _checked(state: Mapping[str, Any], update: dict[str, Any]) -> dict[str, Any]
     return update
 
 
+def route_after_oms(state: Mapping[str, Any]) -> Literal["retrieve_carrier_evidence", "__end__"]:
+    """Deterministic, pure routing decision after the OMS node.
+
+    Validates the complete state first (``validate_state``) and decides from
+    ``oms_evidence`` alone. Returns ``ROUTE_TO_CARRIER`` only for RETRIEVED
+    OMS evidence whose payload matches the ``get_order_details`` contract
+    (exactly ``OMS_PAYLOAD_FIELDS``, all strings) for ``state["order_id"]``;
+    returns ``ROUTE_TO_END`` for any other retrieval status (fail closed, no
+    carrier call). Raises ``InvalidStateError`` when the state is invalid or
+    the OMS evidence is missing or contradicts itself (for example RETRIEVED
+    with a reason code, an attestation or an unusable payload), so forged
+    evidence stops the run instead of being treated as a success.
+
+    Never reads route flags, ``errors``, ``delivery_status``, model output or
+    runtime context, and has no side effects.
+    """
+    validated = validate_state(state)
+    oms = validated["oms_evidence"]
+    if oms is None:
+        raise InvalidStateError("oms_evidence is missing after OMS retrieval")
+    # validate_state has already checked shape, source_system and order match.
+    if oms["retrieval_status"] != RETRIEVED:
+        return ROUTE_TO_END
+    if oms["reason"] is not None or oms["attestation"] is not None:
+        raise InvalidStateError("oms_evidence RETRIEVED carries a failure reason or attestation")
+    if oms["verification"] is not DeliveryStatus.UNVERIFIED:
+        raise InvalidStateError("oms_evidence must be UNVERIFIED")
+    payload = oms["payload"]
+    if not isinstance(payload, dict) or set(payload) != OMS_PAYLOAD_FIELDS:
+        raise InvalidStateError("oms_evidence RETRIEVED has no usable payload")
+    if any(not isinstance(payload[name], str) for name in OMS_PAYLOAD_FIELDS):
+        raise InvalidStateError("oms_evidence payload fields must be strings")
+    if payload["order_id"] != validated["order_id"]:
+        raise InvalidStateError("oms_evidence is for a different order")
+    return ROUTE_TO_CARRIER
+
+
 def build_evidence_graph(
     *,
     carrier_adapter: CarrierTrackingSource | None = None,
     clock: Clock = utc_now,
     freshness_limit: timedelta = SYNTHETIC_FRESHNESS_LIMIT,
 ):
-    """Compile the sequential evidence graph.
+    """Compile the conditional evidence graph (OMS, then carrier only on OMS success).
 
     The keyword arguments are trusted wiring (defaults: synthetic carrier
     adapter, UTC clock, synthetic freshness limit). Invoke with
@@ -211,7 +273,7 @@ def build_evidence_graph(
     builder.add_node(OMS_NODE, oms_node)
     builder.add_node(CARRIER_NODE, carrier_node)
     builder.add_edge(START, OMS_NODE)
-    builder.add_edge(OMS_NODE, CARRIER_NODE)
+    builder.add_conditional_edges(OMS_NODE, route_after_oms, OMS_ROUTES)
     builder.add_edge(CARRIER_NODE, END)
     return builder.compile()
 

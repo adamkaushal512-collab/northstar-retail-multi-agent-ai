@@ -4,8 +4,8 @@
 optional extra and is not imported here. The contract uses standard-library
 ``TypedDict`` plus ``Annotated`` reducers, which is the shape LangGraph's
 ``StateGraph`` accepts, so the same state can be tested offline. The Step 3.3
-evidence nodes live in ``evidence_graph``; no routing, agent count or live
-calls are defined here, and the number of specialists stays a benchmark
+evidence nodes and the Step 3.4 conditional routing live in
+``evidence_graph``; no routing, agent count or live calls are defined here, and the number of specialists stays a benchmark
 parameter (AA sections 3.3, 8).
 
 Reused Phase 2 types (not redefined): ``DeliveryStatus`` and
@@ -58,7 +58,9 @@ UNVERIFIED and ``validate_state`` raises for any VERIFIED claim (in
 that is not backed by trusted carrier evidence.
 
 Enforcement in graph nodes (Step 3.3 ``evidence_graph`` implements the
-first two points for its OMS and carrier nodes; later nodes must follow them):
+first two points for its OMS and carrier nodes, and its Step 3.4
+``route_after_oms`` validates state before routing; later nodes must follow
+them):
 
 - Nodes must obtain carrier evidence only through
   ``retrieve_carrier_evidence`` and must turn ``AccessDeniedError``,
