@@ -1,6 +1,7 @@
 # Minimal CI for the NorthStar Retail repository skeleton (Step 1.8).
 # Runs the unit tests on pull requests to main (pydantic is the only
-# runtime dependency; boto3 is optional and not installed).
+# runtime dependency; the optional langgraph extra is installed so the
+# Step 3.3 graph tests run; boto3 is optional and not installed).
 # No secrets, cloud credentials, external services or infrastructure.
 # Architecture-neutral: tests import alternatives A, B and C independently;
 # no alternative is selected or favored here.
@@ -33,7 +34,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install package dependencies
-        run: python -m pip install .
+        run: python -m pip install '.[langgraph]'
 
       - name: Run unit tests
         env:
