@@ -75,6 +75,8 @@ Two different orchestration problems exist:
    - Graph nodes have **no credentials** and no network path to systems of record; only data-access-layer tools are registered. No built-in or third-party tools with their own network access.
    - The **token cap** (NFR-FIN-02) is enforced across the whole graph run, including all specialists.
    - LangGraph checkpoints, if used, are stored per ADR-003 security rules (encrypted, access-controlled, retention TBD) and are not the audit record.
+   - **Checkpoint resume (Step 3.2 design choice selected by the user; not yet recorded in BD §12):** checkpointed VERIFIED evidence is never trusted automatically. On every resume, the current user is reauthorized and carrier evidence is fetched again through the trusted carrier path before VERIFIED is accepted. Failed reauthorization, an unavailable carrier or invalid evidence leaves the case UNVERIFIED with human review required (D12, D15, D16, D18). Enforcement is Step 3.6 work.
+   - The process-local HMAC attestation in `northstar.orchestration.multi_agent.state` is a temporary integrity safeguard within one process, not a durable trust mechanism. No persistent signing key is introduced. The HMAC key and the trusted runtime context (`AccessContext`) never enter checkpoint state, graph configuration or model input.
    - The graph definition and LangGraph version are part of the version metadata (FR-REC-04).
 5. **No managed agent runtime** in the initial release. Bedrock Agents or Managed Agents may be reconsidered only if they pass the same validations.
 
@@ -87,6 +89,7 @@ Two different orchestration problems exist:
 | LangGraph dependency and upgrade churn | Pin versions; record in version metadata; re-run regression set on upgrade |
 | A framework abstraction could route a tool call around the data access layer | Register only data-access-layer tools; NT-10 checks every tool call produced `authorization.checked` and `evidence.retrieved` events |
 | LangGraph checkpoints may contain evidence or PII | Encrypted, access-controlled storage per ADR-003; minimized fields (FR-EVD-08) |
+| A resumed checkpoint holds VERIFIED evidence that is stale or was retrieved for a different user | Not trusted after resume; reauthorize the current user and fetch carrier evidence again, else UNVERIFIED and human review (Step 3.6) |
 | Operational complexity differs across A, B and C | Measured with AA §7 proxies, including the LangGraph dependency |
 | Step Functions history retention and quotas | Audit kept in ADR-003 stores; verify quotas against NFR-SCL design concurrency |
 | Divergence between workflow state and database state | Database is the source of truth for audit; reconciliation check in NT-03 |
@@ -107,6 +110,8 @@ Two different orchestration problems exist:
 | Same interface for A, B and C | All three run the identical AA §8.2 scenarios unchanged | AA §8 |
 | Latency and concurrency | NFR-LAT-01 at design concurrency | NT-07, NT-09 |
 | Fault tolerance | Degradation rows behave as specified | NT-05 |
+| Checkpoint resume | No VERIFIED result after resume without reauthorization and fresh carrier retrieval; failures read UNVERIFIED with human review | Step 3.6 resume tests |
+| Runtime context not checkpointed | `AccessContext` and the HMAC key never appear in checkpoint state or configuration for the pinned LangGraph version | Step 3.6 checkpoint inspection |
 
 ## 6. Status and Traceability
 
