@@ -95,6 +95,7 @@ class InitialStateTests(unittest.TestCase):
 
         self.assertEqual(state["order_id"], "SYN-ORD-0001")
         self.assertIsNone(state["oms_evidence"])
+        self.assertIsNone(state["oms_analysis"])
         self.assertIsNone(state["carrier_evidence"])
         self.assertIs(state["delivery_status"], DeliveryStatus.UNVERIFIED)
         self.assertIsNone(state["final_investigation"])
@@ -716,6 +717,123 @@ class ReducerAndErrorTests(unittest.TestCase):
         state["errors"] = [{"node": "n", "error_code": "E"}]
         with self.assertRaises(InvalidStateError):
             validate_state(state)
+
+
+def retrieved_oms(order_id="SYN-ORD-0004"):
+    return make_evidence(
+        st.SOURCE_OMS,
+        st.RETRIEVED,
+        retrieved_at=NOW.isoformat(),
+        payload=get_order_details(order_id, access_context=CONTEXT),
+    )
+
+
+class OmsAnalysisTests(unittest.TestCase):
+    """Step 3.5: deterministic, read-only analysis of RETRIEVED OMS evidence."""
+
+    def test_days_are_derived_from_the_promised_date(self):
+        # SYN-ORD-0004 promised 2026-11-11; SYN-ORD-0005 promised 2026-11-06.
+        for order_id, at, expected in (
+            ("SYN-ORD-0004", NOW, -1),
+            ("SYN-ORD-0004", NOW + timedelta(days=1), 0),
+            ("SYN-ORD-0005", NOW, 4),
+            # 23:30 at UTC-05:00 is the next UTC calendar day [Assumption].
+            ("SYN-ORD-0004", datetime(2026, 11, 10, 23, 30, tzinfo=timezone(timedelta(hours=-5))), 0),
+        ):
+            with self.subTest(order_id=order_id, at=at):
+                evidence = retrieved_oms(order_id)
+                analysis = st.derive_oms_analysis(evidence, analyzed_at=at)
+                self.assertEqual(
+                    analysis,
+                    {
+                        "analyzed_at": at.isoformat(),
+                        "promised_delivery_date": evidence["payload"]["promised_delivery_date"],
+                        "days_after_promised_date": expected,
+                    },
+                )
+
+    def test_analysis_is_deterministic_and_does_not_change_evidence(self):
+        evidence = retrieved_oms()
+        before = copy.deepcopy(evidence)
+        results = [st.derive_oms_analysis(evidence, analyzed_at=NOW) for _ in range(3)]
+        self.assertTrue(all(r == results[0] for r in results))
+        self.assertEqual(evidence, before)
+        self.assertEqual(set(results[0]), set(st.OmsAnalysis.__annotations__))
+
+    def test_valid_analysis_is_accepted_in_state(self):
+        state = initial_state("SYN-ORD-0004")
+        state["oms_evidence"] = retrieved_oms()
+        state["oms_analysis"] = st.derive_oms_analysis(state["oms_evidence"], analyzed_at=NOW)
+        self.assertIs(validate_state(state), state)
+        self.assertIs(effective_delivery_status(state), DeliveryStatus.UNVERIFIED)
+
+    def test_unusable_inputs_raise_instead_of_guessing(self):
+        good = retrieved_oms()
+        bad_date = make_evidence(
+            st.SOURCE_OMS, st.RETRIEVED, retrieved_at=NOW.isoformat(),
+            payload={**good["payload"], "promised_delivery_date": "2026-13-40"},
+        )
+        loose_date = make_evidence(
+            st.SOURCE_OMS, st.RETRIEVED, retrieved_at=NOW.isoformat(),
+            payload={**good["payload"], "promised_delivery_date": "20261111"},
+        )
+        cases = {
+            "naive clock": (good, NOW.replace(tzinfo=None)),
+            "clock not a datetime": (good, NOW.isoformat()),
+            "invalid calendar date": (bad_date, NOW),
+            "non-extended date format": (loose_date, NOW),
+            "OMS not retrieved": (make_evidence(st.SOURCE_OMS, st.DENIED, reason="ACCESS_DENIED"), NOW),
+            "carrier record": (make_evidence(st.SOURCE_CARRIER, st.UNAVAILABLE, reason="X"), NOW),
+            "malformed record": ({"payload": good["payload"]}, NOW),
+        }
+        for name, (evidence, at) in cases.items():
+            with self.subTest(case=name), self.assertRaises(InvalidStateError):
+                st.derive_oms_analysis(evidence, analyzed_at=at)
+
+    def test_forged_or_mismatched_analysis_is_rejected(self):
+        evidence = retrieved_oms()
+        good = st.derive_oms_analysis(evidence, analyzed_at=NOW)
+        other_order = retrieved_oms("SYN-ORD-0005")
+        # Same order_id, different promised date: evidence no longer matches.
+        changed = {**other_order, "payload": {**other_order["payload"], "order_id": "SYN-ORD-0004"}}
+        cases = {
+            "no OMS evidence": (good, None),
+            "OMS not retrieved": (good, make_evidence(st.SOURCE_OMS, st.NOT_FOUND, reason="ORDER_NOT_FOUND")),
+            "evidence changed since analysis": (good, changed),
+            "wrong day count": ({**good, "days_after_promised_date": 5}, evidence),
+            "bool day count": ({**good, "days_after_promised_date": False}, evidence),
+            "string day count": ({**good, "days_after_promised_date": "-1"}, evidence),
+            "naive analyzed_at": ({**good, "analyzed_at": NOW.replace(tzinfo=None).isoformat()}, evidence),
+            "different promised date": ({**good, "promised_delivery_date": "2026-11-01"}, evidence),
+            "extra field": ({**good, "is_delayed": True}, evidence),
+            "missing field": ({k: v for k, v in good.items() if k != "analyzed_at"}, evidence),
+            "not a mapping": ([good], evidence),
+        }
+        for name, (analysis, oms) in cases.items():
+            with self.subTest(case=name):
+                state = initial_state("SYN-ORD-0004")
+                state["oms_evidence"] = oms
+                state["oms_analysis"] = analysis
+                with self.assertRaises(InvalidStateError):
+                    validate_state(state)
+
+    def test_analysis_has_no_reducer_and_no_verdict(self):
+        hints = get_type_hints(InvestigationState, include_extras=True)
+        self.assertFalse(hasattr(hints["oms_analysis"], "__metadata__"))
+        names = " ".join(st.OmsAnalysis.__annotations__).lower()
+        for part in ("verif", "delayed", "status", "conclusion", "recommend"):
+            self.assertNotIn(part, names)
+
+    def test_rejection_messages_carry_no_values(self):
+        state = initial_state("SYN-ORD-0004")
+        state["oms_evidence"] = retrieved_oms()
+        state["oms_analysis"] = {
+            **st.derive_oms_analysis(state["oms_evidence"], analyzed_at=NOW),
+            "promised_delivery_date": "SYN-SECRET-should-never-appear",
+        }
+        with self.assertRaises(InvalidStateError) as raised:
+            validate_state(state)
+        self.assertNotIn("SYN-SECRET", str(raised.exception))
 
 
 class RuntimeContextTests(unittest.TestCase):
