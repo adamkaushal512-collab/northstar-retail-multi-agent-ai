@@ -1,7 +1,7 @@
-"""Unit tests for the Steps 3.3 to 3.5 OMS-first evidence graph.
+"""Unit tests for the Steps 3.3 to 3.6F OMS-first evidence graph.
 
 Covers OMS retrieval, conditional routing, the parallel carrier and OMS
-analysis branches and the fan-in barrier. Tests never assume an order
+analysis branches, the fan-in barrier and optional checkpointing (Step 3.6F). Tests never assume an order
 between the two parallel branches.
 
 Synthetic data and in-memory adapters only. No AWS, Bedrock, carrier or
@@ -861,6 +861,93 @@ class RuntimeContextIsolationTests(unittest.TestCase):
         with mock.patch("socket.socket", side_effect=AssertionError("network used")):
             out = eg.build_evidence_graph().invoke(initial_state("SYN-ORD-0004"), context=RUNTIME)
         self.assertIs(out["delivery_status"], DeliveryStatus.VERIFIED)
+
+
+def thread(thread_id):
+    return {"configurable": {"thread_id": thread_id}}
+
+
+@unittest.skipUnless(HAS_LANGGRAPH, "optional langgraph extra not installed")
+class CheckpointTests(unittest.TestCase):
+    """Step 3.6F: optional checkpointer wiring only (no resume or refresh)."""
+
+    def setUp(self):
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        self.saver = InMemorySaver()
+        self.graph = graph(checkpointer=self.saver)
+
+    def test_checkpointer_defaults_to_none(self):
+        self.assertIsNone(eg.build_evidence_graph().checkpointer)
+        self.assertIsNone(graph(checkpointer=None).checkpointer)
+
+    def test_supplied_checkpointer_is_attached(self):
+        self.assertIs(self.graph.checkpointer, self.saver)
+
+    def test_checkpointed_run_requires_a_thread_id(self):
+        with self.assertRaises(ValueError):
+            self.graph.invoke(initial_state("SYN-ORD-0004"), context=RUNTIME)
+        self.assertEqual(list(self.saver.list(None)), [])
+
+    def test_final_state_is_stored_under_the_thread_id(self):
+        out = self.graph.invoke(initial_state("SYN-ORD-0004"), context=RUNTIME, config=thread("SYN-THREAD-1"))
+        snapshot = self.graph.get_state(thread("SYN-THREAD-1"))
+        self.assertEqual(snapshot.values, out)
+        self.assertEqual(snapshot.next, ())
+        validate_state(snapshot.values)
+        self.assertIs(snapshot.values["delivery_status"], DeliveryStatus.VERIFIED)
+        stored = {c.config["configurable"]["thread_id"] for c in self.saver.list(None)}
+        self.assertEqual(stored, {"SYN-THREAD-1"})
+
+    def test_checkpoints_cover_each_superstep_including_the_join(self):
+        self.graph.invoke(initial_state("SYN-ORD-0004"), context=RUNTIME, config=thread("SYN-THREAD-1"))
+        history = list(self.graph.get_state_history(thread("SYN-THREAD-1")))
+        # Input, OMS, parallel branches (one superstep), join; newest first.
+        self.assertEqual([h.metadata["step"] for h in history], [3, 2, 1, 0, -1])
+        self.assertCountEqual(history[2].next, eg.PARALLEL_NODES)
+        self.assertEqual(history[1].next, (eg.JOIN_NODE,))
+
+    def test_threads_are_isolated(self):
+        self.graph.invoke(initial_state("SYN-ORD-0004"), context=RUNTIME, config=thread("SYN-THREAD-1"))
+        self.graph.invoke(initial_state("SYN-ORD-0004"), context=None, config=thread("SYN-THREAD-2"))
+        first = self.graph.get_state(thread("SYN-THREAD-1")).values
+        second = self.graph.get_state(thread("SYN-THREAD-2")).values
+        self.assertIs(first["delivery_status"], DeliveryStatus.VERIFIED)
+        self.assertIs(second["delivery_status"], DeliveryStatus.UNVERIFIED)
+        self.assertEqual(codes(second), [(eg.OMS_NODE, eg.ACCESS_DENIED, st.SOURCE_OMS)])
+        self.assertEqual(list(self.graph.get_state_history(thread("SYN-THREAD-3"))), [])
+
+    def test_fail_closed_safe_exit_is_checkpointed_unchanged(self):
+        out = self.graph.invoke(initial_state("SYN-ORD-0004"), context=None, config=thread("SYN-THREAD-1"))
+        self.assertEqual(out, run("SYN-ORD-0004", context=None))
+        self.assertEqual(self.graph.get_state(thread("SYN-THREAD-1")).values, out)
+        self.assertIsNone(out["carrier_evidence"])
+
+    def test_same_results_with_and_without_checkpointer(self):
+        for order_id, context in (("SYN-ORD-0004", RUNTIME), ("SYN-ORD-0004", None), ("SYN-ORD-0003", RUNTIME)):
+            with self.subTest(order_id=order_id, context=context is not None):
+                with_saver = self.graph.invoke(
+                    initial_state(order_id), context=context, config=thread(f"{order_id}-{context is None}")
+                )
+                self.assertEqual(with_saver, run(order_id, context=context))
+
+    def test_forged_input_still_stops_a_checkpointed_run(self):
+        state = initial_state("SYN-ORD-0004")
+        state["delivery_status"] = DeliveryStatus.VERIFIED
+        with self.assertRaises(InvalidStateError):
+            self.graph.invoke(state, context=RUNTIME, config=thread("SYN-THREAD-1"))
+
+    def test_runtime_context_is_not_checkpointed(self):
+        self.graph.invoke(initial_state("SYN-ORD-0004"), context=RUNTIME, config=thread("SYN-THREAD-1"))
+        ctx = RUNTIME.access_context
+        for snapshot in self.graph.get_state_history(thread("SYN-THREAD-1")):
+            dumped = json.dumps(snapshot.values, default=str)
+            for value in (ctx.user_id, ctx.tenant_id, *ctx.user_permissions, *ctx.service_scopes):
+                self.assertNotIn(value, dumped)
+            self.assertNotIn(st._ATTESTATION_KEY.hex(), dumped)
+            self.assertFalse(
+                any(isinstance(v, (AccessContext, InvestigationRuntimeContext)) for v in snapshot.values.values())
+            )
 
 
 if __name__ == "__main__":
