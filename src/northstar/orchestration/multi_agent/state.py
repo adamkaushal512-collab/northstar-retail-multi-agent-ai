@@ -4,9 +4,10 @@
 optional extra and is not imported here. The contract uses standard-library
 ``TypedDict`` plus ``Annotated`` reducers, which is the shape LangGraph's
 ``StateGraph`` accepts, so the same state can be tested offline. The Step 3.3
-evidence nodes and the Step 3.4 conditional routing live in
-``evidence_graph``; no routing, agent count or live calls are defined here, and the number of specialists stays a benchmark
-parameter (AA sections 3.3, 8).
+evidence nodes, the Step 3.4 conditional routing and the Step 3.5 parallel
+fan-out and fan-in live in ``evidence_graph``; no routing, agent count or
+live calls are defined here, and the number of specialists stays a
+benchmark parameter (AA sections 3.3, 8).
 
 Reused Phase 2 types (not redefined): ``DeliveryStatus`` and
 ``DelayedDeliveryInvestigation`` from ``northstar.evidence.investigation_schema``;
@@ -102,10 +103,10 @@ recorded in BD section 12; enforcement is Step 3.6 work, not implemented):
 Parallel updates. In LangGraph a key without a reducer accepts one write per
 step and raises on concurrent writes, which is the desired fail-closed
 behavior for single-writer fields (``order_id``, ``oms_evidence``,
-``carrier_evidence``, ``delivery_status``, ``final_investigation``). OMS and
-carrier retrieval write different keys, so they can run in parallel without
-a reducer. Reducers are used only where concurrent writes are expected and
-safe to merge:
+``oms_analysis``, ``carrier_evidence``, ``delivery_status``,
+``final_investigation``). Parallel nodes must write different keys, so they
+need no reducer. Reducers are used only where concurrent writes are
+expected and safe to merge:
 
 - ``errors``: ``merge_errors`` appends validated ``SafeError`` items.
 - ``requires_human_review``: ``keep_human_review`` always returns true, so
@@ -113,6 +114,25 @@ safe to merge:
 
 ``delivery_status`` deliberately has no reducer: a merge rule cannot tell
 concurrent writes from a later verification step, so it stays single-writer.
+
+OMS analysis (Step 3.5) [Proposal; FR-OMS-01, FR-EVD-01]. ``oms_analysis`` is
+a deterministic, read-only fact derived from RETRIEVED OMS evidence by
+``derive_oms_analysis``: the whole calendar days from the OMS promised
+delivery date to the analysis date (negative before, zero on, positive
+after that date). It is not evidence, not a status and not a conclusion: it
+never verifies delivery, never says whether a case is "delayed" (no
+threshold or policy is applied; thresholds are Step 1.4 NFR or policy
+items) and never changes ``oms_evidence``. Contract:
+
+- Writer: only the Step 3.5 analysis node. No reducer (single writer).
+- ``None`` until analysis succeeds, and ``None`` when it fails (the node adds
+  a ``SafeError``); nothing is filled in.
+- ``validate_state`` re-derives it from ``oms_evidence`` and rejects it unless
+  ``oms_evidence`` is RETRIEVED OMS evidence whose payload holds the same
+  ``promised_delivery_date`` and the day count matches ``analyzed_at``. A
+  forged or stale value (for example after ``oms_evidence`` changes) fails.
+- [Assumption] The promised date is a calendar date compared with the UTC
+  date of ``analyzed_at``; the OMS date's time-zone semantics are [Open].
 
 Trusted runtime context (not checkpointed). Checkpointed state holds case
 data only: no ``AccessContext``, credentials, tokens or adapters.
@@ -138,7 +158,7 @@ import json
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Literal, Mapping, TypedDict
 
 from northstar.evidence.investigation_schema import (
@@ -298,11 +318,25 @@ def keep_human_review(current: object, update: object) -> Literal[True]:
     return True
 
 
+class OmsAnalysis(TypedDict):
+    """Deterministic fact derived from RETRIEVED OMS evidence (Step 3.5).
+
+    ``promised_delivery_date`` is copied unchanged from the OMS payload so the
+    analysis stays bound to the evidence it came from; ``analyzed_at`` is the
+    trusted clock time. No conclusion, verification or free text.
+    """
+
+    analyzed_at: str
+    promised_delivery_date: str
+    days_after_promised_date: int
+
+
 class InvestigationState(TypedDict):
     """Checkpointable state for one delayed-delivery investigation."""
 
     order_id: str
     oms_evidence: EvidenceRecord | None
+    oms_analysis: OmsAnalysis | None
     carrier_evidence: EvidenceRecord | None
     delivery_status: DeliveryStatus
     final_investigation: DelayedDeliveryInvestigation | None
@@ -332,6 +366,7 @@ def initial_state(order_id: str) -> InvestigationState:
     return InvestigationState(
         order_id=_require_order_id(order_id),
         oms_evidence=None,
+        oms_analysis=None,
         carrier_evidence=None,
         delivery_status=DeliveryStatus.UNVERIFIED,
         final_investigation=None,
@@ -639,6 +674,63 @@ def retrieve_carrier_evidence(
     return validate_evidence(record)
 
 
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _days_after_promised_date(promised_delivery_date: object, analyzed_at: datetime) -> int:
+    if not isinstance(promised_delivery_date, str) or not _DATE_RE.fullmatch(promised_delivery_date):
+        raise InvalidStateError("promised_delivery_date must be an ISO 8601 date")
+    try:
+        promised = date.fromisoformat(promised_delivery_date)
+    except ValueError:
+        raise InvalidStateError("promised_delivery_date must be an ISO 8601 date") from None
+    return (analyzed_at.astimezone(timezone.utc).date() - promised).days
+
+
+def validate_oms_analysis(analysis: object, oms_evidence: object) -> OmsAnalysis:
+    """Raise ``InvalidStateError`` unless ``analysis`` re-derives from ``oms_evidence``."""
+    if not isinstance(analysis, dict) or set(analysis) != set(OmsAnalysis.__annotations__):
+        raise InvalidStateError("oms_analysis must have exactly the OmsAnalysis fields")
+    if not _is_aware_iso(analysis["analyzed_at"]):
+        raise InvalidStateError("oms_analysis analyzed_at must be a timezone-aware ISO 8601 string")
+    if type(analysis["days_after_promised_date"]) is not int:
+        raise InvalidStateError("oms_analysis days_after_promised_date must be an int")
+    if not (
+        isinstance(oms_evidence, dict)
+        and oms_evidence.get("source_system") == SOURCE_OMS
+        and oms_evidence.get("retrieval_status") == RETRIEVED
+        and isinstance(oms_evidence.get("payload"), dict)
+    ):
+        raise InvalidStateError("oms_analysis requires RETRIEVED OMS evidence")
+    promised = analysis["promised_delivery_date"]
+    if oms_evidence["payload"].get("promised_delivery_date") != promised:
+        raise InvalidStateError("oms_analysis does not match the OMS evidence")
+    derived = _days_after_promised_date(promised, datetime.fromisoformat(analysis["analyzed_at"]))
+    if derived != analysis["days_after_promised_date"]:
+        raise InvalidStateError("oms_analysis days_after_promised_date does not match its inputs")
+    return analysis  # type: ignore[return-value]
+
+
+def derive_oms_analysis(oms_evidence: EvidenceRecord, *, analyzed_at: datetime) -> OmsAnalysis:
+    """Deterministic, read-only analysis of RETRIEVED OMS evidence; never mutates it.
+
+    ``analyzed_at`` comes from trusted wiring (the graph's clock) and must be
+    timezone-aware. Raises ``InvalidStateError`` for unusable input rather
+    than guessing a value.
+    """
+    if not isinstance(analyzed_at, datetime) or analyzed_at.utcoffset() is None:
+        raise InvalidStateError("analyzed_at must be a timezone-aware datetime")
+    record = validate_evidence(oms_evidence)
+    payload = record["payload"] if isinstance(record["payload"], dict) else {}
+    promised = payload.get("promised_delivery_date")
+    analysis = OmsAnalysis(
+        analyzed_at=analyzed_at.isoformat(),
+        promised_delivery_date=promised,  # type: ignore[typeddict-item]
+        days_after_promised_date=_days_after_promised_date(promised, analyzed_at),
+    )
+    return validate_oms_analysis(analysis, record)
+
+
 def effective_delivery_status(state: Mapping[str, Any]) -> DeliveryStatus:
     """Fail-closed read: VERIFIED only if the state claims it and trusted carrier evidence agrees."""
     try:
@@ -681,6 +773,9 @@ def validate_state(state: object) -> InvestigationState:
             ):
                 # A structurally valid VERIFIED claim is still self-declared.
                 raise InvalidStateError(f"{name} VERIFIED is not from the trusted carrier path")
+
+    if state["oms_analysis"] is not None:
+        validate_oms_analysis(state["oms_analysis"], state["oms_evidence"])
 
     if not isinstance(state["delivery_status"], DeliveryStatus):
         raise InvalidStateError("delivery_status must be a DeliveryStatus")

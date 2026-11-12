@@ -1,13 +1,20 @@
-"""Unit tests for the Step 3.3/3.4 conditional OMS -> carrier evidence graph.
+"""Unit tests for the Steps 3.3 to 3.5 OMS-first evidence graph.
+
+Covers OMS retrieval, conditional routing, the parallel carrier and OMS
+analysis branches and the fan-in barrier. Tests never assume an order
+between the two parallel branches.
 
 Synthetic data and in-memory adapters only. No AWS, Bedrock, carrier or
 other network calls. Skipped when the optional ``langgraph`` extra is not
 installed (``pip install .[langgraph]``).
 """
 
+import contextlib
 import copy
 import importlib.util
 import json
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -68,6 +75,14 @@ def executed_nodes(order_id="SYN-ORD-0004", context=RUNTIME, state=None, **kwarg
     return [next(iter(u)) for u in updates]
 
 
+def assert_fanout_run(test, nodes):
+    """OMS first, both parallel branches once each (any order), then the join."""
+    test.assertEqual(len(nodes), 4)
+    test.assertEqual(nodes[0], eg.OMS_NODE)
+    test.assertCountEqual(nodes[1:3], eg.PARALLEL_NODES)
+    test.assertEqual(nodes[3], eg.JOIN_NODE)
+
+
 def oms_payload(order_id="SYN-ORD-0004"):
     return {
         "order_id": order_id,
@@ -105,28 +120,41 @@ class _WrongTrackingAdapter:
 
 @unittest.skipUnless(HAS_LANGGRAPH, "optional langgraph extra not installed")
 class GraphStructureTests(unittest.TestCase):
-    def test_oms_routes_conditionally_to_carrier_or_end(self):
+    def test_oms_fans_out_conditionally_and_joins(self):
         drawn = graph().get_graph()
-        self.assertEqual(set(drawn.nodes), {"__start__", "__end__", *eg.NODE_ORDER})
-        edges = [(e.source, e.target, e.conditional) for e in drawn.edges]
         self.assertEqual(
-            sorted(edges),
-            sorted(
-                [
-                    ("__start__", eg.OMS_NODE, False),
-                    (eg.OMS_NODE, eg.CARRIER_NODE, True),
-                    (eg.OMS_NODE, "__end__", True),
-                    (eg.CARRIER_NODE, "__end__", False),
-                ]
-            ),
+            set(drawn.nodes),
+            {"__start__", "__end__", eg.OMS_NODE, eg.CARRIER_NODE, eg.ANALYSIS_NODE, eg.JOIN_NODE},
+        )
+        edges = [(e.source, e.target, e.conditional) for e in drawn.edges]
+        self.assertCountEqual(
+            edges,
+            [
+                ("__start__", eg.OMS_NODE, False),
+                (eg.OMS_NODE, eg.CARRIER_NODE, True),
+                (eg.OMS_NODE, eg.ANALYSIS_NODE, True),
+                (eg.OMS_NODE, "__end__", True),
+                (eg.CARRIER_NODE, eg.JOIN_NODE, False),
+                (eg.ANALYSIS_NODE, eg.JOIN_NODE, False),
+                (eg.JOIN_NODE, "__end__", False),
+            ],
         )
 
-    def test_route_map_has_only_carrier_and_end(self):
-        self.assertEqual(eg.OMS_ROUTES, {eg.CARRIER_NODE: eg.CARRIER_NODE, eg.END: eg.END})
+    def test_join_is_an_explicit_waiting_edge_on_both_branches(self):
+        builder = graph().builder
+        self.assertEqual(builder.waiting_edges, {(eg.PARALLEL_NODES, eg.JOIN_NODE)})
+        # Neither branch has its own direct edge to the join or to END.
+        self.assertEqual(builder.edges, {("__start__", eg.OMS_NODE), (eg.JOIN_NODE, "__end__")})
 
-    def test_nodes_run_in_order_once_each(self):
-        updates = graph().stream(initial_state("SYN-ORD-0004"), context=RUNTIME, stream_mode="updates")
-        self.assertEqual([next(iter(u)) for u in updates], list(eg.NODE_ORDER))
+    def test_route_map_has_only_the_branches_and_end(self):
+        self.assertEqual(
+            eg.OMS_ROUTES,
+            {eg.CARRIER_NODE: eg.CARRIER_NODE, eg.ANALYSIS_NODE: eg.ANALYSIS_NODE, eg.END: eg.END},
+        )
+        self.assertCountEqual(eg.ROUTE_TO_EVIDENCE, (eg.CARRIER_NODE, eg.ANALYSIS_NODE))
+
+    def test_each_node_runs_once(self):
+        assert_fanout_run(self, executed_nodes("SYN-ORD-0004"))
 
     def test_no_checkpointer_is_attached(self):
         self.assertIsNone(graph().checkpointer)
@@ -336,11 +364,13 @@ class StateMergingTests(unittest.TestCase):
         self.assertIsNone(out["carrier_evidence"])
 
     def test_nodes_write_only_their_own_keys(self):
-        updates = list(
-            graph().stream(initial_state("SYN-ORD-0004"), context=RUNTIME, stream_mode="updates")
-        )
-        self.assertEqual(set(updates[0][eg.OMS_NODE]), {"oms_evidence"})
-        self.assertEqual(set(updates[1][eg.CARRIER_NODE]), {"carrier_evidence", "delivery_status"})
+        updates = {}
+        for update in graph().stream(initial_state("SYN-ORD-0004"), context=RUNTIME, stream_mode="updates"):
+            updates.update(update)
+        self.assertEqual(set(updates[eg.OMS_NODE]), {"oms_evidence"})
+        self.assertEqual(set(updates[eg.CARRIER_NODE]), {"carrier_evidence", "delivery_status"})
+        self.assertEqual(set(updates[eg.ANALYSIS_NODE]), {"oms_analysis"})
+        self.assertIsNone(updates[eg.JOIN_NODE])  # the barrier writes nothing
 
     def test_human_review_and_order_id_are_preserved(self):
         for order_id in ("SYN-ORD-0004", "SYN-ORD-0006", "SYN-ORD-0003"):
@@ -374,7 +404,7 @@ class ConditionalRoutingGraphTests(unittest.TestCase):
         validate_state(out)
 
     def test_successful_oms_routes_to_carrier(self):
-        self.assertEqual(executed_nodes("SYN-ORD-0004"), list(eg.NODE_ORDER))
+        assert_fanout_run(self, executed_nodes("SYN-ORD-0004"))
         out = run("SYN-ORD-0004")
         self.assertEqual(out["oms_evidence"]["retrieval_status"], st.RETRIEVED)
         self.assertTrue(is_trusted_carrier_evidence(out["carrier_evidence"]))
@@ -382,7 +412,7 @@ class ConditionalRoutingGraphTests(unittest.TestCase):
 
     def test_successful_oms_with_unverified_carrier_still_routes_to_carrier(self):
         # Routing to carrier is not verification: the carrier result decides.
-        self.assertEqual(executed_nodes("SYN-ORD-0006"), list(eg.NODE_ORDER))
+        assert_fanout_run(self, executed_nodes("SYN-ORD-0006"))
         out = run("SYN-ORD-0006")
         self.assertIs(out["delivery_status"], DeliveryStatus.UNVERIFIED)
         self.assertIs(out["requires_human_review"], True)
@@ -474,7 +504,7 @@ class RouteAfterOmsTests(unittest.TestCase):
     """The routing function in isolation: pure, deterministic, fail closed."""
 
     def test_retrieved_usable_oms_routes_to_carrier(self):
-        self.assertEqual(eg.route_after_oms(state_with_oms()), eg.ROUTE_TO_CARRIER)
+        self.assertEqual(eg.route_after_oms(state_with_oms()), eg.ROUTE_TO_EVIDENCE)
 
     def test_unsuccessful_statuses_route_to_end(self):
         for status in (st.DENIED, st.NOT_FOUND, st.ERROR, st.UNAVAILABLE):
@@ -493,7 +523,7 @@ class RouteAfterOmsTests(unittest.TestCase):
         self.assertEqual(eg.route_after_oms(state), eg.ROUTE_TO_END)  # no error items needed
         state = state_with_oms()
         state["errors"] = [make_safe_error(eg.OMS_NODE, "ROUTE_TO_END", source_system=st.SOURCE_OMS)]
-        self.assertEqual(eg.route_after_oms(state), eg.ROUTE_TO_CARRIER)
+        self.assertEqual(eg.route_after_oms(state), eg.ROUTE_TO_EVIDENCE)
 
     def test_missing_oms_evidence_is_rejected(self):
         with self.assertRaises(InvalidStateError):
@@ -551,7 +581,7 @@ class RouteAfterOmsTests(unittest.TestCase):
                 state["oms_evidence"] = st.make_evidence(
                     st.SOURCE_OMS, st.RETRIEVED, retrieved_at=NOW.isoformat(), payload=result
                 )
-                self.assertEqual(eg.route_after_oms(state), eg.ROUTE_TO_CARRIER)
+                self.assertEqual(eg.route_after_oms(state), eg.ROUTE_TO_EVIDENCE)
 
     def test_validate_state_rejects_unexpected_keys_directly(self):
         for key in ("route", "access_context", "credentials"):
@@ -567,6 +597,244 @@ class RouteAfterOmsTests(unittest.TestCase):
         with self.assertRaises(InvalidStateError) as raised:
             eg.route_after_oms(state)
         self.assertNotIn(SECRET_TEXT, str(raised.exception))
+
+
+def expected_analysis(promised, at=NOW):
+    return {
+        "analyzed_at": at.isoformat(),
+        "promised_delivery_date": promised,
+        "days_after_promised_date": (at.date() - datetime.fromisoformat(promised).date()).days,
+    }
+
+
+@unittest.skipUnless(HAS_LANGGRAPH, "optional langgraph extra not installed")
+class ParallelExecutionTests(unittest.TestCase):
+    """Step 3.5: carrier retrieval and OMS analysis run in parallel, then fan in."""
+
+    def test_branches_are_scheduled_in_the_same_superstep(self):
+        steps = {}
+        for event in graph().stream(initial_state("SYN-ORD-0004"), context=RUNTIME, stream_mode="debug"):
+            if event["type"] == "task":
+                steps.setdefault(event["payload"]["name"], []).append(event["step"])
+        self.assertEqual(set(steps), {eg.OMS_NODE, *eg.PARALLEL_NODES, eg.JOIN_NODE})
+        self.assertTrue(all(len(v) == 1 for v in steps.values()))  # each node once
+        (oms,), (carrier,), (analysis,), (join,) = (
+            steps[eg.OMS_NODE], steps[eg.CARRIER_NODE], steps[eg.ANALYSIS_NODE], steps[eg.JOIN_NODE]
+        )
+        self.assertEqual(carrier, analysis)
+        self.assertEqual(carrier, oms + 1)
+        self.assertEqual(join, carrier + 1)
+
+    def test_branches_actually_run_concurrently(self):
+        # A two-party barrier only opens if both branches are inside it at the
+        # same time; sequential execution would time out and break it.
+        barrier = threading.Barrier(2, timeout=5)
+        passed = []
+
+        def rendezvous(name, real):
+            def call(*args, **kwargs):
+                barrier.wait()
+                passed.append((name, threading.get_ident()))
+                return real(*args, **kwargs)
+            return call
+
+        carrier = rendezvous("carrier", st.retrieve_carrier_evidence)
+        analysis = rendezvous("analysis", st.derive_oms_analysis)
+        with mock.patch.object(eg, "retrieve_carrier_evidence", carrier), \
+                mock.patch.object(eg, "derive_oms_analysis", analysis):
+            out = run("SYN-ORD-0004")
+        self.assertFalse(barrier.broken)
+        self.assertCountEqual([name for name, _ in passed], ["carrier", "analysis"])
+        self.assertEqual(len({ident for _, ident in passed}), 2)
+        self.assertEqual(out["errors"], [])
+        self.assertIs(out["delivery_status"], DeliveryStatus.VERIFIED)
+        self.assertIsNotNone(out["oms_analysis"])
+
+    def test_join_runs_once_after_both_branches(self):
+        seen = []
+        real_join = eg.validate_merged_evidence
+
+        def spy(state):
+            seen.append(copy.deepcopy(dict(state)))
+            return real_join(state)
+
+        real_derive = st.derive_oms_analysis
+
+        def slow_derive(*args, **kwargs):
+            time.sleep(0.2)  # the join must still wait for this branch
+            return real_derive(*args, **kwargs)
+
+        with mock.patch.object(eg, "validate_merged_evidence", spy), \
+                mock.patch.object(eg, "derive_oms_analysis", slow_derive):
+            out = run("SYN-ORD-0004")
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0]["carrier_evidence"])
+        self.assertIsNotNone(seen[0]["oms_analysis"])
+        self.assertEqual(seen[0]["oms_analysis"], out["oms_analysis"])
+
+    def test_successful_merge_combines_both_branches(self):
+        direct = get_order_details("SYN-ORD-0004", access_context=access())
+        out = run("SYN-ORD-0004")
+        validate_state(out)
+        self.assertEqual(out["oms_evidence"]["payload"], direct)  # evidence unchanged
+        self.assertEqual(out["oms_analysis"], expected_analysis(direct["promised_delivery_date"]))
+        self.assertEqual(out["oms_analysis"]["days_after_promised_date"], -1)
+        self.assertTrue(is_trusted_carrier_evidence(out["carrier_evidence"]))
+        self.assertIs(out["delivery_status"], DeliveryStatus.VERIFIED)
+        self.assertEqual(out["errors"], [])
+        self.assertIs(out["requires_human_review"], True)
+        self.assertIsNone(out["final_investigation"])
+
+    def test_analysis_never_verifies_or_changes_delivery_status(self):
+        # Promised date has passed (SYN-ORD-0005) but the carrier is stale:
+        # the analysis fact is recorded, delivery stays UNVERIFIED.
+        out = run("SYN-ORD-0005")
+        self.assertEqual(out["oms_analysis"]["days_after_promised_date"], 4)
+        self.assertIs(out["delivery_status"], DeliveryStatus.UNVERIFIED)
+        self.assertEqual(codes(out), [(eg.CARRIER_NODE, "STALE_CARRIER_DATA", st.SOURCE_CARRIER)])
+        self.assertNotIn("verification", out["oms_analysis"])
+
+    def test_errors_from_both_branches_merge_without_ordering(self):
+        state = initial_state("SYN-ORD-0004")
+        earlier = make_safe_error("earlier_step", "EARLIER_CODE")
+        state["errors"] = [earlier]
+        ctx = InvestigationRuntimeContext(access(user_perms=(OMS_ORDER_READ,)))
+        with mock.patch.object(eg, "derive_oms_analysis", side_effect=RuntimeError(SECRET_TEXT)):
+            out = run("SYN-ORD-0004", context=ctx, state=state)
+        self.assertEqual(out["errors"][0], earlier)  # earlier errors are never reordered
+        self.assertCountEqual(
+            out["errors"][1:],
+            [
+                make_safe_error(eg.CARRIER_NODE, eg.ACCESS_DENIED, source_system=st.SOURCE_CARRIER),
+                make_safe_error(eg.ANALYSIS_NODE, eg.OMS_ANALYSIS_ERROR, source_system=st.SOURCE_OMS),
+            ],
+        )
+        self.assertIsNone(out["oms_analysis"])
+        self.assertIs(out["delivery_status"], DeliveryStatus.UNVERIFIED)
+        self.assertNotIn(SECRET_TEXT, json.dumps(out, default=str))
+        validate_state(out)
+
+
+@unittest.skipUnless(HAS_LANGGRAPH, "optional langgraph extra not installed")
+class ParallelFailClosedTests(unittest.TestCase):
+    def test_failed_oms_skips_both_branches_and_the_join(self):
+        cases = (
+            ({"context": None}, "SYN-ORD-0004", None),
+            ({}, "SYN-ORD-0003", None),
+            ({}, "SYN-ORD-0004", RuntimeError(SECRET_TEXT)),
+            ({}, "SYN-ORD-0004", InvalidStateError(SECRET_TEXT)),
+        )
+        for kwargs, order_id, oms_fault in cases:
+            with self.subTest(order_id=order_id, kwargs=list(kwargs), fault=type(oms_fault).__name__):
+                with contextlib.ExitStack() as stack:
+                    carrier = stack.enter_context(mock.patch.object(eg, "retrieve_carrier_evidence"))
+                    derive = stack.enter_context(mock.patch.object(eg, "derive_oms_analysis"))
+                    if oms_fault is not None:
+                        stack.enter_context(mock.patch.object(eg, "get_order_details", side_effect=oms_fault))
+                    nodes = executed_nodes(order_id, **kwargs)
+                    out = run(order_id, **kwargs)
+                self.assertEqual(nodes, [eg.OMS_NODE])
+                carrier.assert_not_called()
+                derive.assert_not_called()
+                self.assertIsNone(out["oms_analysis"])
+                self.assertIsNone(out["carrier_evidence"])
+                self.assertIs(out["delivery_status"], DeliveryStatus.UNVERIFIED)
+                self.assertIs(out["requires_human_review"], True)
+                self.assertNotIn(SECRET_TEXT, json.dumps(out, default=str))
+
+    def test_invalid_oms_evidence_never_reaches_the_branches(self):
+        with mock.patch.object(eg, "get_order_details", return_value=oms_payload("SYN-ORD-0001")), \
+                mock.patch.object(eg, "retrieve_carrier_evidence") as carrier, \
+                mock.patch.object(eg, "derive_oms_analysis") as derive:
+            with self.assertRaises(InvalidStateError):
+                run("SYN-ORD-0004")
+        carrier.assert_not_called()
+        derive.assert_not_called()
+
+    def test_carrier_failure_keeps_the_analysis(self):
+        for kwargs, code in (
+            ({"carrier_adapter": _RaisingAdapter()}, "CARRIER_ADAPTER_ERROR"),
+            ({"carrier_adapter": _WrongTrackingAdapter()}, "MALFORMED_CARRIER_RESPONSE"),
+        ):
+            with self.subTest(code=code):
+                assert_fanout_run(self, executed_nodes(**kwargs))
+                out = run("SYN-ORD-0004", **kwargs)
+                self.assertEqual(out["oms_analysis"], expected_analysis("2026-11-11"))
+                self.assertIs(out["delivery_status"], DeliveryStatus.UNVERIFIED)
+                self.assertEqual(codes(out), [(eg.CARRIER_NODE, code, st.SOURCE_CARRIER)])
+                self.assertNotIn(SECRET_TEXT, json.dumps(out, default=str))
+        with mock.patch.object(eg, "retrieve_carrier_evidence", side_effect=RuntimeError(SECRET_TEXT)):
+            out = run("SYN-ORD-0004")
+        self.assertEqual(out["carrier_evidence"]["retrieval_status"], st.ERROR)
+        self.assertIsNotNone(out["oms_analysis"])
+        self.assertEqual(codes(out), [(eg.CARRIER_NODE, eg.CARRIER_RETRIEVAL_ERROR, st.SOURCE_CARRIER)])
+
+    def test_carrier_denial_does_not_block_or_widen_the_analysis(self):
+        # The analysis reads only OMS evidence this user was authorized for;
+        # it calls no tool and needs no carrier permission.
+        ctx = InvestigationRuntimeContext(access(user_perms=(OMS_ORDER_READ,)))
+        with mock.patch("northstar.orchestration.multi_agent.state.get_carrier_tracking",
+                        side_effect=AccessDeniedError("permission")) as tool:
+            out = run("SYN-ORD-0004", context=ctx)
+        tool.assert_called_once()
+        self.assertIs(tool.call_args.kwargs["access_context"], ctx.access_context)
+        self.assertEqual(out["carrier_evidence"]["retrieval_status"], st.DENIED)
+        self.assertIsNone(out["carrier_evidence"]["payload"])
+        self.assertEqual(out["oms_analysis"], expected_analysis("2026-11-11"))
+        self.assertEqual(codes(out), [(eg.CARRIER_NODE, eg.ACCESS_DENIED, st.SOURCE_CARRIER)])
+        self.assertIs(out["delivery_status"], DeliveryStatus.UNVERIFIED)
+
+    def test_unusable_promised_date_fails_closed_without_a_value(self):
+        payload = {**oms_payload(), "promised_delivery_date": "next tuesday"}
+        with mock.patch.object(eg, "get_order_details", return_value=payload):
+            out = run("SYN-ORD-0004")
+        self.assertIsNone(out["oms_analysis"])
+        self.assertEqual(out["oms_evidence"]["payload"], payload)  # evidence kept as retrieved
+        self.assertIn((eg.ANALYSIS_NODE, eg.INVALID_OMS_ANALYSIS, st.SOURCE_OMS), codes(out))
+        self.assertTrue(is_trusted_carrier_evidence(out["carrier_evidence"]))
+        validate_state(out)
+
+    def test_forged_analysis_in_input_state_stops_the_run(self):
+        forged = initial_state("SYN-ORD-0004")
+        forged["oms_analysis"] = expected_analysis("2026-11-11")  # no OMS evidence behind it
+        with self.assertRaises(InvalidStateError):
+            run("SYN-ORD-0004", state=forged)
+
+    def test_join_rejects_an_incomplete_or_invalid_merge(self):
+        complete = run("SYN-ORD-0004")
+        self.assertEqual(eg.validate_merged_evidence(complete), {})
+        no_carrier = {**complete, "carrier_evidence": None}
+        oms_failed = {**state_with_oms(st.DENIED), "carrier_evidence": complete["carrier_evidence"]}
+        tampered = copy.deepcopy(complete)
+        tampered["oms_analysis"]["days_after_promised_date"] += 1
+        forged_verified = {**complete, "carrier_evidence": {**complete["carrier_evidence"], "source": "X"}}
+        extra_key = {**complete, "route": eg.JOIN_NODE}
+        for name, state in {
+            "missing carrier evidence": no_carrier,
+            "OMS not RETRIEVED": oms_failed,
+            "tampered analysis": tampered,
+            "tampered VERIFIED carrier evidence": forged_verified,
+            "unexpected key": extra_key,
+        }.items():
+            with self.subTest(case=name), self.assertRaises(InvalidStateError):
+                eg.validate_merged_evidence(state)
+
+    def test_concurrent_writes_to_single_writer_fields_are_rejected(self):
+        # Writer ownership is enforced by LangGraph itself for keys without a
+        # reducer: two writers in one step raise instead of merging.
+        from langgraph.errors import InvalidUpdateError
+        from langgraph.graph import END, START, StateGraph
+
+        for key, value in (("oms_analysis", None), ("delivery_status", DeliveryStatus.UNVERIFIED)):
+            with self.subTest(key=key):
+                builder = StateGraph(st.InvestigationState)
+                builder.add_node("first", lambda s, k=key, v=value: {k: v})
+                builder.add_node("second", lambda s, k=key, v=value: {k: v})
+                builder.add_edge(START, "first")
+                builder.add_edge(START, "second")
+                builder.add_edge(["first", "second"], END)
+                with self.assertRaises(InvalidUpdateError):
+                    builder.compile().invoke(initial_state("SYN-ORD-0004"))
 
 
 @unittest.skipUnless(HAS_LANGGRAPH, "optional langgraph extra not installed")
