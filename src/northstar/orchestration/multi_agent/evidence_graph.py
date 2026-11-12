@@ -40,8 +40,11 @@ writes ``carrier_evidence`` and ``delivery_status``; the analysis node writes
 order between the two branches not guaranteed). These keys have no reducer,
 so a second writer in the same step is rejected by LangGraph (fail closed).
 
-No checkpointer, retries, recovery, model nodes or human approval steps
-(later steps; human steps stay outside LangGraph, ADR-002 section 3.4).
+Checkpointing (Step 3.6F) is optional and off by default: a caller may pass
+a LangGraph ``BaseCheckpointSaver`` to ``build_evidence_graph``, which only
+attaches it at compile time. No resume, evidence refresh, durable storage,
+retries, model nodes or human approval steps (later steps; human steps stay
+outside LangGraph, ADR-002 section 3.4).
 
 Trust boundary [Decision D16; FR-AUTH-01, FR-AUTH-02]:
 
@@ -88,6 +91,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any, Literal, Mapping
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
@@ -248,12 +252,26 @@ def build_evidence_graph(
     carrier_adapter: CarrierTrackingSource | None = None,
     clock: Clock = utc_now,
     freshness_limit: timedelta = SYNTHETIC_FRESHNESS_LIMIT,
+    checkpointer: BaseCheckpointSaver | None = None,
 ):
     """Compile the evidence graph (OMS; on success, carrier and analysis in parallel, then fan-in).
 
     The keyword arguments are trusted wiring (defaults: synthetic carrier
     adapter, UTC clock, synthetic freshness limit). Invoke with
     ``graph.invoke(initial_state(order_id), context=InvestigationRuntimeContext(...))``.
+
+    ``checkpointer`` is optional trusted wiring and defaults to ``None``: the
+    graph is compiled without a checkpointer and behaves exactly as before.
+    When a ``BaseCheckpointSaver`` is supplied, it is passed unchanged to
+    ``compile()`` and LangGraph saves a checkpoint of the state channels
+    after each superstep. Every invocation must then supply a thread ID,
+    ``config={"configurable": {"thread_id": ...}}``; LangGraph rejects a
+    checkpointed run without one. Checkpoints hold state only (evidence,
+    errors, statuses), never the runtime context, so identity and
+    permissions must be passed again on every call. The saver choice,
+    storage, retention and access control are the caller's responsibility
+    [Open]. This step adds no resume or evidence refresh: re-invoking a
+    thread does not re-validate the freshness of evidence already stored.
     """
 
     def oms_node(
@@ -353,5 +371,5 @@ def build_evidence_graph(
     # Explicit fan-in: the join waits for every listed branch to finish.
     builder.add_edge(list(PARALLEL_NODES), JOIN_NODE)
     builder.add_edge(JOIN_NODE, END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
